@@ -4,7 +4,7 @@
 #      在外部调 GitHub API，通过 repository_dispatch 事件触发。
 #
 # 触发源（由setup_scheduler.ps1 注册）：
-#   - 开机 / 登录      → 延迟 StartDelayMinutes 分钟后再跑，等代理软件就绪
+#   - 开机 / 登录      → 由计划任务延迟 3 分钟后执行，等代理软件就绪
 #   - 周一/周四 10:00   → 覆盖「整周不关机」的情况（不会触发开机事件）
 #   - 周一/周四 10:00–23:00 每 30 分钟 → 网络失败时的重试
 #
@@ -20,8 +20,7 @@
 param(
     [switch]$KeepAlive,
     [switch]$Force,
-    [switch]$Probe,
-    [int]$StartDelayMinutes = 0
+    [switch]$Probe
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,14 +42,6 @@ function Write-Log {
         }
     }
     Write-Output "[$ts] $Message"
-}
-
-# ------------------------------------------------------- 开机延迟
-# 开机瞬间网络栈尚未就绪，代理软件也需要时间启动。
-# 延迟后再执行，避免必然失败的第一次尝试。
-if ($StartDelayMinutes -gt 0) {
-    Write-Output "[$(Get-Date -Format 'HH:mm:ss')] 等待 $StartDelayMinutes 分钟后执行（等待网络/代理就绪）..."
-    Start-Sleep -Seconds ($StartDelayMinutes * 60)
 }
 
 # ---------------------------------------------------------------- Token
@@ -92,7 +83,7 @@ else {
             exit 0
         }
 
-        $stampFile = Join-Path $scriptDir '.last_push_date.txt'
+        $stampFile = $markerFile
         if (Test-Path $stampFile) {
             $raw = (Get-Content $stampFile -Raw).Trim()
             if ($raw -eq $today.ToString('yyyy-MM-dd')) {
@@ -109,8 +100,8 @@ $uri = 'https://api.github.com/repos/LinJieSha/zotero-arxiv-daily/dispatches'
 $body = @{ event_type = $eventType } | ConvertTo-Json
 
 if ($Probe) {
-    # 只验证网络与凭据，不真正触发。用于重试循环里区分
-    # 「网络还没通」与「已经推过了」，避免重复提交。
+    # ⚠️ 仅用于人工诊断。探测成功后直接退出，不会触发任何 workflow。
+    #    切勿把 -Probe 接到计划任务的触发器上 —— 那样推送会静默失效。
     try {
         Invoke-WebRequest -Uri 'https://api.github.com/rate_limit' `
             -Headers @{ Authorization = "Bearer $token"; 'User-Agent' = 'zotero-daily-trigger' } `
@@ -148,9 +139,13 @@ try {
 }
 catch {
     $msg = $_.Exception.Message
-    # 401 = token 失效或过期，这是需要人工处理的问题，单独标注
-    if ($msg -match '401') {
-        Write-Log "触发失败：GitHub Token 无效或已过期（401）。需在 https://github.com/settings/tokens 新建 token 并更新 github_token.txt —— $msg" -IsError
+    # 取真实的 HTTP 状态码，而不是在错误消息里搜 "401"。
+    # 端口号、超时秒数都可能含 401，字符串匹配会误判并误导排查方向。
+    $status = $null
+    try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+    # 401 = token 失效或过期，这是唯一需要人工处理的问题，单独标注
+    if ($status -eq 401) {
+        Write-Log "触发失败：GitHub Token 无效或已过期（HTTP 401）。需在 https://github.com/settings/tokens 新建 token 并更新 github_token.txt" -IsError
     }
     else {
         Write-Log "触发失败（网络不可达或 GitHub 暂时异常，将由后续重试自动补上）—— $msg" -IsError
