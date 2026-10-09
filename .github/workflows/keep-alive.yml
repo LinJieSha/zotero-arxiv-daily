@@ -2,8 +2,13 @@ name: Keep Alive
 
 on:
   workflow_dispatch:
+  # 与主 workflow 同理：fork 的 schedule 被禁用，靠外部 API 触发。
+  # 这个 workflow 的作用是产生 commit 防止仓库 60 天无活动被停用定时任务，
+  # 所以必须能被触发，否则它自己也救不了自己。
+  repository_dispatch:
+    types: [keep-alive]
   schedule:
-    # Run every 30 days at 00:00 UTC to keep the repository active
+    # 每 30 天一次（若 GitHub 放开 fork 限制则自动生效）
     - cron: '0 0 */30 * *'
 
 jobs:

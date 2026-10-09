@@ -1,9 +1,14 @@
 name: Send emails twice a week
 on:
   workflow_dispatch:
+  # GitHub 禁用 fork 仓库的 schedule（定时任务），但允许外部通过 API 推送
+  # repository_dispatch 事件触发。这条路径已实测可用（HTTP 204）。
+  # 由 Windows 任务计划程序在每周一/周四 14:00 调 API 触发。
+  repository_dispatch:
+    types: [scheduled-run]
   schedule:
-    # 每周一、周四 北京时间 14:00
-    # GitHub Actions 的 cron 固定用 UTC（北京 = UTC+8），星期用 0-6：周日=0 周一=1 … 周四=4
+    # 保留原 cron：若将来 GitHub 放开 fork 限制，或仓库脱离 fork 网络，可直接生效
+    # 每周一、周四 北京时间 14:00（GitHub cron 固定用 UTC，北京 = UTC+8）
     - cron: '0 6 * * 1,4'
 
 jobs:
