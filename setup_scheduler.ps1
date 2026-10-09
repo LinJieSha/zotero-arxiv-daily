@@ -56,17 +56,38 @@ $commonArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$m
 $paperAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $commonArgs
 $keepAction  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "$commonArgs -KeepAlive"
 
-# --- 4. 触发器：每次开机 ---
+# --- 4. 触发器 ---
 # Windows 计划任务没有"仅在指定星期开机时触发"这种触发器，只有
-# "每次开机"和"每次登录"。这里用「每次开机 + 脚本内按星期判断」实现：
-#   - 周一开机 -> 推送
-#   - 周四开机 -> 推送
-#   - 其余时间开机 -> 脚本判定后直接跳过，零开销、无副作用
-# 这样即使周一整天没开机、周三才开机，也会补推一次，不会漏。
+# "每次开机"和"每次登录"。要覆盖「周日晚上不关机、周一整天没开机操作」
+# 这种场景，必须额外加「固定时刻」触发器。
+#
+# 四类触发器协同，共享同一套去重逻辑（.last_push_date.txt），一天仍只发一封：
+#   1. 开机（延迟 3 分钟）  —— 等代理软件启动完成，否则网络请求必失败
+#   2. 登录（延迟 3 分钟）  —— 覆盖睡眠唤醒、快速用户切换
+#   3. 周一/周四 10:00定时  —— ★ 覆盖持续开机、整天无开关机的场景
+#   4. 周一/周四 10:00-23:00 每 30 分钟 —— ★ 网络失败后自动重试
 $bootTrigger = New-ScheduledTaskTrigger -AtStartup
+$bootTrigger.Delay = 'PT3M'
 
-# 登录时再触发一次，覆盖"开机但未登录"的场景（睡眠唤醒、快速用户切换）
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+$logonTrigger.Delay = 'PT3M'
+
+# 定时触发：周一、周四各一个
+$mondayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '10:00'
+$thursdayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Thursday -At '10:00'
+
+# 重试触发：周一、周四 10:30-23:00 每 30 分钟一次
+#
+# New-ScheduledTaskTrigger 的 -RepetitionInterval 只在 -Once 参数集里可用，
+# 所以先建一个 -Once 触发器取出 Repetition 定义，再赋给 -Weekly 触发器。
+# 这样重复只发生在指定星期内；直接用 -Once 会变成「从今天起每天重复」，
+# 导致非计划日也被唤醒。
+$retryTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Thursday -At '10:30'
+$retryTrigger.Repetition = (
+    New-ScheduledTaskTrigger -Once -At '10:30' `
+        -RepetitionInterval (New-TimeSpan -Minutes 30) `
+        -RepetitionDuration ([TimeSpan]::FromHours(12.5))
+).Repetition
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -80,10 +101,10 @@ $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interac
 Register-ScheduledTask `
     -TaskName $taskName `
     -Action $paperAction `
-    -Trigger @($bootTrigger, $logonTrigger) `
+    -Trigger @($bootTrigger, $logonTrigger, $mondayTrigger, $thursdayTrigger, $retryTrigger) `
     -Settings $settings `
     -Principal $principal `
-    -Description '开机/登录时检查，若为周一或周四且本周期未推送则触发' | Out-Null
+    -Description '开机/登录(延迟3分钟) +周一周四10:00 + 每30分钟重试；当天已推送则跳过' | Out-Null
 
 # --- 5. Keep Alive：每天开机时检查，脚本内限制每 30 天只做一次 ---
 Register-ScheduledTask `
@@ -96,16 +117,20 @@ Register-ScheduledTask `
 
 Write-Host "`n计划任务已安装`n" -ForegroundColor Green
 Write-Host "【论文推送】$taskName" -ForegroundColor Cyan
-Write-Host "  触发    : 每次开机 / 每次登录"
+Write-Host "  触发器  :"
+Write-Host "    1. 开机+3分钟 / 登录+3分钟（等代理软件就绪）"
+Write-Host "    2. 周一 10:00、周四 10:00（覆盖整天不开机的场景）"
+Write-Host "    3. 周一/周四 10:30-23:00 每 30 分钟（网络失败自动重试）"
 Write-Host "  逻辑    : 仅当今天是周一或周四、且当天尚未推送时才真正触发"
 Write-Host ""
 Write-Host "【Keep Alive】$keepTaskName" -ForegroundColor Cyan
-Write-Host "  触发    : 每次开机（脚本内限制每 30 天只做一次）"
+Write-Host "  触发    : 每次开机+3分钟（脚本内限制每 30 天只做一次）"
 Write-Host ''
 Write-Host "常用命令：" -ForegroundColor DarkGray
 Write-Host "  查看状态  : Get-ScheduledTask -TaskName $taskName | Get-ScheduledTaskInfo"
 Write-Host "  立即测试  : Start-ScheduledTask -TaskName $taskName"
 Write-Host "  强制推送  : .\trigger_workflow.ps1 -Force"
+Write-Host "  查看失败  : Get-Content .trigger_failures.log -Tail 20"
 Write-Host "  删除      : Unregister-ScheduledTask -TaskName $taskName,\`$keepTaskName -Confirm:\`$false"
 Write-Host ''
-Write-Host "说明：周末或非计划日开机时，脚本会判定后直接退出，不会有任何动作。" -ForegroundColor Yellow
+Write-Host "说明：所有触发器共享去重标记，一天只会收到一封邮件。" -ForegroundColor Yellow

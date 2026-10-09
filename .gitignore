@@ -23,3 +23,6 @@ github_token.txt
 # local scheduler state files (never commit)
 .last_push_date.txt
 .last_keepalive_date.txt
+
+# trigger failure log (local diagnostics only)
+.trigger_failures.log
