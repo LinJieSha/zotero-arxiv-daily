@@ -17,3 +17,9 @@ models
 test-compose.yml
 outputs
 config/private.yaml
+# GitHub token for local workflow trigger (never commit)
+github_token.txt
+
+# local scheduler state files (never commit)
+.last_push_date.txt
+.last_keepalive_date.txt
