@@ -1,8 +1,10 @@
-name: Send emails daily
+name: Send emails twice a week
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 22 * * *'
+    # 每周一、周四 北京时间 14:00
+    # GitHub Actions 的 cron 固定用 UTC（北京 = UTC+8），星期用 0-6：周日=0 周一=1 … 周四=4
+    - cron: '0 6 * * 1,4'
 
 jobs:
   calculate-and-send:

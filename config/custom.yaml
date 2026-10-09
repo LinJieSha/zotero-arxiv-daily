@@ -1,27 +1,73 @@
+# 个人配置 —— 由 CUSTOM_CONFIG 变量同步（修改这里后需同步到 GitHub Variables）
+# 上游默认值见 config/base.yaml，此文件仅覆盖需要改动的项。
+#
+# 注意：GitHub Actions 每次运行都会用 Variables 里的 CUSTOM_CONFIG 覆盖本文件，
+#      所以本地改完也要同步到 GitHub Variables，否则线上不生效。
+
 zotero:
   user_id: ${oc.env:ZOTERO_ID}
   api_key: ${oc.env:ZOTERO_KEY}
-  include_path: null # Or set a list of glob patterns, e.g. ["2026/survey/**","2026/reading-group/**"]
+  # 按研究档案的 collection 组织后，可收窄到核心目录以聚焦重排信号：
+  # include_path: ["LLM-MAS安全/**", "博弈机制设计/**"]
+  include_path: null
+  ignore_path: null
+
+source:
+  arxiv:
+    # 对应《科研方向档案》4.1 节：cs.MA 多智能体系统（MAS 主战场）。
+    #
+    # 实测日均条数（RSS 抽样）：
+    #   cs.MA        ~31 条   ← 采用
+    #   cs.CR+cs.MA ~115 条
+    #   cs.MA+cs.AI ~487 条   ← 噪音过大且全文下载量翻 4 倍
+    #
+    # 刻意不含 cs.CR：大量是纯系统安全/侧信道/密码学工作，属档案 3.3 排除项。
+    # 刻意不含 cs.AI：机制设计类工作确实有，但日均 487 条里绝大多数与本方向无关，
+    # 靠 reranker 也筛不干净，且每篇都要下载全文（retriever 在重排前全量下载），
+    # 会撞 GitHub Actions 6 小时限额。这类论文靠 Zotero 库的重排信号召回即可。
+    category: ["cs.MA"]
+    include_cross_list: false
 
 email:
   sender: ${oc.env:SENDER}
   receiver: ${oc.env:RECEIVER}
   smtp_server: smtp.qq.com
   smtp_port: 465
+  # QQ 邮箱 SMTP 授权码，不是 QQ 登录密码
   sender_password: ${oc.env:SENDER_PASSWORD}
 
 llm:
   api:
     key: ${oc.env:OPENAI_API_KEY}
+    # DeepSeek 官方 OpenAI 兼容端点
     base_url: ${oc.env:OPENAI_API_BASE}
+  # 必须是 chat_completion：response 模式调用 responses.create()，
+  # DeepSeek 的兼容层也没有该端点
   api_mode: chat_completion
   generation_kwargs:
-    model: gpt-4o-mini
+    model: deepseek-flash
+    # base.yaml 默认 16384。单句 TL;DR 用不到 512，降下来显著省成本
+    max_tokens: 512
+    # DeepSeek 的思考模式默认开启（effort=high），写一句话 TL;DR 完全不需要。
+    # 关闭后成本和延迟都显著下降。
+    # extra_body 是 OpenAI SDK 的标准参数，会被合并进请求体，
+    # 上游 protocol.py 把 generation_kwargs 原样展开给 API 调用，因此无需改代码。
+    # 注意：这是 DeepSeek 专属参数，换回 Claude 时必须删掉这一段。
+    extra_body:
+      thinking:
+        type: disabled
+  language: Chinese
 
-source:
-  arxiv:
-    category: ["cs.AI","cs.CV","cs.LG","cs.CL"]
+reranker:
+  local:
+    # DeepSeek 也没有 embeddings API，只能用本地 embedding 模型
+    model: jinaai/jina-embeddings-v5-text-nano-retrieval
 
 executor:
-  debug: ${oc.env:DEBUG,null}
+  # 本地首次验证保持 true（只取 10 篇）；上云前改回 false
+  debug: true
+  send_empty: false
+  # 每篇论文消耗 2 次 LLM 调用（TL;DR + 作者单位）。调大前先算成本。
+  max_paper_num: 30
   source: ['arxiv']
+  reranker: local

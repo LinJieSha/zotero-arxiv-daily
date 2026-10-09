@@ -9,9 +9,26 @@ import json
 RawPaperItem = TypeVar('RawPaperItem')
 
 
+def _to_plain_dict(value):
+    """把 OmegaConf 的 DictConfig/ListConfig 递归转成原生 dict/list。
+
+    上游这里原本只做了 dict(...) 浅拷贝，嵌套结构仍是 DictConfig。
+    OpenAI SDK 的 extra_body 要求原生 dict，直接传 DictConfig 会失败，
+    因此对需要原样传给 API 的嵌套参数做递归转换。
+    """
+    from omegaconf import DictConfig, ListConfig, OmegaConf
+
+    if isinstance(value, (DictConfig, ListConfig)):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
 def _request_llm(openai_client: OpenAI, llm_params: dict, messages: list[dict]) -> str:
     api_mode = llm_params.get("api_mode", "chat_completion")
-    generation_kwargs = dict(llm_params.get("generation_kwargs", {}))
+    generation_kwargs = {
+        k: _to_plain_dict(v)
+        for k, v in dict(llm_params.get("generation_kwargs", {})).items()
+    }
 
     if api_mode == "chat_completion":
         response = openai_client.chat.completions.create(
