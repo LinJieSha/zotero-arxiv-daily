@@ -3,18 +3,21 @@
 # 背景：GitHub 禁用 fork 仓库的 schedule（cron）定时任务。用 Windows 计划任务
 #      在外部调 GitHub API，通过 repository_dispatch 事件触发。
 #
-# 触发源（由setup_scheduler.ps1 注册）：
+# 触发源（由 setup_scheduler.ps1 注册）：
 #   - 开机 / 登录      → 由计划任务延迟 3 分钟后执行，等代理软件就绪
 #   - 周一/周四 10:00   → 覆盖「整周不关机」的情况（不会触发开机事件）
-#   - 周一/周四 10:00–23:00 每 30 分钟 → 网络失败时的重试
 #
 # 去重：记录「已推送的日期」，同一天无论触发多少次只发一封。
 #       漏掉的计划日不补推（补推只能拿到最新论文，补不回丢失的那批）。
 #
+# 失败重试：没有定时重试。若推送因网络失败，当天的开机/登录触发
+#       会自然补上（去重标记只在成功时写入）；若当天再无开关机，
+#       则需手动执行本脚本 —— 失败会记入 .trigger_failures.log。
+#
 # 用法：
 #   .\trigger_workflow.ps1              按计划逻辑触发（计划任务调用）
 #   .\trigger_workflow.ps1 -Force       无条件触发（手动测试）
-#   .\trigger_workflow.ps1 -Probe       只探测网络，不推送（重试时避免重复提交）
+#   .\trigger_workflow.ps1 -Probe       只探测网络，不推送（仅供人工诊断）
 #   .\trigger_workflow.ps1 -KeepAlive   触发 Keep Alive（防仓库 60 天无活动）
 
 param(
@@ -148,7 +151,7 @@ catch {
         Write-Log "触发失败：GitHub Token 无效或已过期（HTTP 401）。需在 https://github.com/settings/tokens 新建 token 并更新 github_token.txt" -IsError
     }
     else {
-        Write-Log "触发失败（网络不可达或 GitHub 暂时异常，将由后续重试自动补上）—— $msg" -IsError
+        Write-Log "触发失败（网络不可达或 GitHub 暂时异常）—— $msg" -IsError
     }
     exit 1
 }
