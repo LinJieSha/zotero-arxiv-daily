@@ -5,7 +5,11 @@
 #
 # 触发源（由 setup_scheduler.ps1 注册）：
 #   - 开机 / 登录      → 由计划任务延迟 3 分钟后执行，等代理软件就绪
-#   - 周一/周四 10:00   → 覆盖「整周不关机」的情况（不会触发开机事件）
+#   - 周二 / 周五 10:00 → 覆盖「整天不关机」的情况（不会触发开机事件）
+#
+# 为什么是周二/周五：arXiv 的 RSS 每天定点放出论文（条目 published
+# 为当天 00:00 美东 = 北京时间 20:00），周一早上 10:00 抓到的仍是空 feed。
+# 顺延一天才能拿到周一晚放出的那一批。详见 setup_scheduler.ps1 的注释。
 #
 # 去重：记录「已推送的日期」，同一天无论触发多少次只发一封。
 #       漏掉的计划日不补推（补推只能拿到最新论文，补不回丢失的那批）。
@@ -81,8 +85,8 @@ else {
     if (-not $Force) {
         $today = (Get-Date).Date
 
-        if ($today.DayOfWeek -ne 'Monday' -and $today.DayOfWeek -ne 'Thursday') {
-            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm')] 今天不是计划日（周一/周四），跳过。"
+        if ($today.DayOfWeek -ne 'Tuesday' -and $today.DayOfWeek -ne 'Friday') {
+            Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm')] 今天不是计划日（周二/周五），跳过。"
             exit 0
         }
 

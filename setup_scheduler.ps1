@@ -8,15 +8,21 @@
 # 触发器设计（四个）：
 #   1. 开机 +3 分钟       —— 延迟等代理软件启动
 #   2. 登录 +3 分钟       —— 覆盖睡眠唤醒、快速用户切换
-#   3. 周一 10:00         —— 覆盖「周日晚上不关机、周一整天无开关机操作」
-#   4. 周四 10:00         —— 同上
+#   3. 周二 10:00         —— 覆盖「周一整天不开关机」的场...
+#   4. 周五 10:00         —— 同上
+#
+# 为什么是周二/周五而不是周一/周四：
+#   arXiv 的 RSS 不是持续更新的，而是每天定点放出。实测数据：
+#     feed 条目的 published = 当天 00:00 美东时间 = 北京时间当天 20:00
+#     feed 头部 updated     = 放出时刻（实测 04:01 UTC = 北京 12:01）
+#   也就是说，北京时间早上 10:00 抓到的必然是「前一天晚上放出的那一批」。
+#   要拿到周一提交的那批，得等 arXiv 在周一晚放出、周二早上才抓得到。
+#   结论：定点触发放在 arXiv 放出之后的下一个上午，才能拿到最新论文。
 #
 # 去重：trigger_workflow.ps1 内置"当天是否已推送"判断，
 #       上述触发器共用同一标记，因此一天只会发一次。
 #
-# 曾有一个「10:30 起每 30 分钟重试」的触发器，已按需求删除：
-# 网络失败时当天收不到邮件，但 10:00 的定点触发已经覆盖了
-# 「当天开过机」这个更常见的场景，反复重试的边际收益很低。
+# 曾有一个「10:30 起每 30 分钟重试」的触发器，已按需求删除。
 #
 # 用法：.\setup_scheduler.ps1
 
@@ -61,8 +67,6 @@ foreach ($tn in @($taskName, $keepTaskName)) {
 #   -WindowStyle Hidden，所以任务运行时仍会闪出一个黑框。
 #   WshShell.Run(cmd, 0, False) 的 0 = SW_HIDE，
 #   进程从创建那一刻起就没有窗口，不会闪。
-# 注意：实际启动命令由下面的 New-LauncherVbs 生成，
-# 这里不用 -WindowStyle Hidden（对控制台程序无效，详见下方注释）。
 
 $vbsPaper = Join-Path $scriptDir 'run_hidden.vbs'
 $vbsKeep  = Join-Path $scriptDir 'run_hidden_keepalive.vbs'
@@ -98,16 +102,20 @@ $keepAction  = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsK
 
 # --- 4. 触发器 ---
 # Windows 计划任务没有"仅在指定星期开机时触发"这种触发器，只有
-# "每次开机"和"每次登录"。要覆盖「周日晚上不关机、周一整天没开关机」
-# 这种场景，必须额外加「固定时刻」触发器。
+# "每次开机"和"每次登录"。要覆盖「整天没开关机」的场景，
+# 必须额外加「固定时刻」触发器。
 $bootTrigger = New-ScheduledTaskTrigger -AtStartup
 $bootTrigger.Delay = 'PT3M'
 
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
 $logonTrigger.Delay = 'PT3M'
 
-$mondayTrigger   = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday  -At '10:00'
-$thursdayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Thursday -At '10:00'
+# 周二 / 周五，而不是周一 / 周四 ——
+# 因为 arXiv 的 RSS 每天定点放出论文（条目 published 为当天 00:00 美东
+# = 北京时间 20:00），周一早上 10:00 抓到的仍是空 feed。
+# 顺延一天才能拿到周一晚放出的那一批。
+$tuesdayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Tuesday -At '10:00'
+$fridayTrigger  = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Friday  -At '10:00'
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -121,10 +129,10 @@ $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interac
 Register-ScheduledTask `
     -TaskName $taskName `
     -Action $paperAction `
-    -Trigger @($bootTrigger, $logonTrigger, $mondayTrigger, $thursdayTrigger) `
+    -Trigger @($bootTrigger, $logonTrigger, $tuesdayTrigger, $fridayTrigger) `
     -Settings $settings `
     -Principal $principal `
-    -Description '开机/登录(延迟3分钟) + 周一周四10:00；当天已推送则跳过' | Out-Null
+    -Description '开机/登录(延迟3分钟) + 周二周五10:00；当天已推送则跳过' | Out-Null
 
 # --- 5. Keep Alive：开机时检查，脚本内限制每 30 天只做一次 ---
 Register-ScheduledTask `
@@ -139,8 +147,8 @@ Write-Host "`n计划任务已安装`n" -ForegroundColor Green
 Write-Host "【论文推送】$taskName" -ForegroundColor Cyan
 Write-Host "  触发器  :"
 Write-Host "    1. 开机+3分钟 / 登录+3分钟（等代理软件就绪）"
-Write-Host "    2. 周一 10:00、周四 10:00（覆盖整天不开机的场景）"
-Write-Host "  逻辑    : 仅当今天是周一或周四、且当天尚未推送时才真正触发"
+Write-Host "    2. 周二 10:00、周五 10:00（覆盖整天不开机的场景）"
+Write-Host "  逻辑    : 仅当今天是周二或周五、且当天尚未推送时才真正触发"
 Write-Host ""
 Write-Host "【Keep Alive】$keepTaskName" -ForegroundColor Cyan
 Write-Host "  触发    : 每次开机+3分钟（脚本内限制每 30 天只做一次）"
