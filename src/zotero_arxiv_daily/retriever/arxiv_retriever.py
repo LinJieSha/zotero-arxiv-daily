@@ -4,7 +4,8 @@ from arxiv import Result as ArxivResult
 from ..protocol import Paper
 from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
 import calendar
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 import multiprocessing
 import os
 from queue import Empty
@@ -23,6 +24,7 @@ T = TypeVar("T")
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+API_QUERY_TIMEOUT = 60
 
 HTML_TAG_PATTERN = re.compile(
     r"</?(?:p|a|span|div|b|i|strong|em|br|hr|h[1-6]|ul|ol|li|sub|sup|table|tr|td|th)\b(?:\s+[^>]*)?/?>",
@@ -32,6 +34,157 @@ ARXIV_HEADER_PATTERN = re.compile(
     r"^(?:arxiv:\s*\S+(?:\s+\[[^\]]*\])?)?\s*(?:announce\s+type:\s*[\w-]+)?\s*(?:abstract:\s*)?",
     flags=re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------- time helpers
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_aware_utc(value: Any) -> datetime | None:
+    """Normalise any datetime (naive or aware) to an aware UTC datetime.
+
+    The arxiv library returns naive datetimes in UTC; feedparser returns aware
+    ones. Mixing the two would raise on comparison, so everything is converted
+    to aware UTC here.
+    """
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_entry_time(struct_time: Any) -> datetime:
+    """Turn a feedparser ``*_parsed`` value into an aware UTC datetime.
+
+    feedparser's values come in two shapes: a 9-tuple ``time.struct_time`` from
+    ``calendar.timegm``, or an int/float POSIX timestamp depending on the
+    parser version. Both must be accepted; anything else yields datetime.min so
+    callers can detect "unknown" without an exception. ``struct_time`` only
+    exists on some builds, so it is resolved defensively.
+    """
+    if not struct_time:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if isinstance(struct_time, (int, float)) and not isinstance(struct_time, bool):
+        try:
+            return datetime.fromtimestamp(struct_time, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            pass
+    if isinstance(struct_time, (tuple, list)) and len(struct_time) >= 6:
+        try:
+            return datetime(*[int(x) for x in struct_time[:6]], tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _age_header_seconds(response: Any) -> int | None:
+    """Read the CDN ``Age`` header (seconds the cached copy has been served)."""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("Age")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------ feed parsing
+
+
+def _clean_abstract(summary_raw: str) -> str:
+    cleaned = HTML_TAG_PATTERN.sub(" ", summary_raw).strip()
+    cleaned = ARXIV_HEADER_PATTERN.sub("", cleaned).strip()
+    cleaned = re.sub(r"^abstract:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    return " ".join(cleaned.split())
+
+
+def _extract_authors(entry: Any) -> list[ArxivResult.Author]:
+    author_str = getattr(entry, "author", "") or ""
+    if not author_str and hasattr(entry, "authors") and entry.authors:
+        author_str = ", ".join(
+            a.get("name", "") if isinstance(a, dict) else getattr(a, "name", str(a))
+            for a in entry.authors
+        )
+    author_names = [a.strip() for a in author_str.split(",") if a.strip()]
+    if not author_names:
+        author_names = ["Unknown"]
+    return [ArxivResult.Author(name=name) for name in author_names]
+
+
+def _entry_to_arxiv_result(entry: Any) -> ArxivResult:
+    raw_id = getattr(entry, "id", "") or ""
+    paper_id = raw_id.removeprefix("oai:arXiv.org:")
+    title_raw = getattr(entry, "title", "") or ""
+    title = " ".join(title_raw.split())
+
+    authors = _extract_authors(entry)
+    summary = _clean_abstract(getattr(entry, "summary", "") or "")
+
+    link = getattr(entry, "link", "") or f"https://arxiv.org/abs/{paper_id}"
+    pdf_url = f"https://arxiv.org/pdf/{paper_id}"
+    source_url = f"https://arxiv.org/src/{paper_id}"
+
+    # Feed entries carry <category> elements; feedparser exposes them as plain
+    # dicts (entry.meta stays a dict because only the top level is converted),
+    # so use getitem here. A leading "cs." prefix marks a non-primary category
+    # on cross-listed entries; those are dropped first when the caller
+    # filters by its own category list.
+    # Real feed entries are FeedParserDict, but attribute access must work for
+    # any mapping-like stub too (tests, and older feedparser versions).
+    tags = getattr(entry, "tags", None)
+    if tags is None:
+        tags = entry["tags"] if "tags" in entry else []
+    tags = tags or []
+    categories = [
+        t.get("term") for t in tags
+        if isinstance(t, dict) and t.get("term")
+    ]
+    # Prefer Atom's authoritative arxiv:primary_category field, with fallback to first category
+    primary_category = ""
+    arxiv_primary = getattr(entry, "arxiv_primary_category", None)
+    if isinstance(arxiv_primary, dict):
+        primary_category = arxiv_primary.get("term", "") or ""
+    elif hasattr(arxiv_primary, "term"):
+        primary_category = getattr(arxiv_primary, "term", "") or ""
+    elif isinstance(arxiv_primary, str):
+        primary_category = arxiv_primary
+
+    if not primary_category and categories:
+        primary_category = categories[0]
+
+    published = _parse_entry_time(getattr(entry, "published_parsed", None))
+    updated = _parse_entry_time(getattr(entry, "updated_parsed", None))
+    comment = getattr(entry, "arxiv_comment", "") or ""
+    journal_ref = getattr(entry, "arxiv_journal_reference", "") or getattr(entry, "arxiv_journal_ref", "") or ""
+    doi = getattr(entry, "arxiv_doi", "") or ""
+
+    links = [
+        ArxivResult.Link(href=link, rel="alternate"),
+        ArxivResult.Link(href=pdf_url, title="pdf", rel="related"),
+        ArxivResult.Link(href=source_url, title="source", rel="related"),
+    ]
+
+    return ArxivResult(
+        entry_id=link,
+        updated=updated,
+        published=published,
+        title=title,
+        authors=authors,
+        summary=summary,
+        comment=comment,
+        journal_ref=journal_ref,
+        doi=doi,
+        primary_category=primary_category,
+        categories=categories,
+        links=links,
+    )
+
+
+# ------------------------------------------------------------ downloads / extraction
 
 
 def _download_file(url: str, path: str) -> None:
@@ -119,94 +272,6 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         return file_contents["all"]
 
 
-def _clean_abstract(summary_raw: str) -> str:
-    cleaned = HTML_TAG_PATTERN.sub(" ", summary_raw).strip()
-    cleaned = ARXIV_HEADER_PATTERN.sub("", cleaned).strip()
-    cleaned = re.sub(r"^abstract:\s*", "", cleaned, flags=re.IGNORECASE).strip()
-    return " ".join(cleaned.split())
-
-
-def _extract_authors(entry: Any) -> list[ArxivResult.Author]:
-    author_str = getattr(entry, "author", "") or ""
-    if not author_str and hasattr(entry, "authors") and entry.authors:
-        author_str = ", ".join(
-            a.get("name", "") if isinstance(a, dict) else getattr(a, "name", str(a))
-            for a in entry.authors
-        )
-    author_names = [a.strip() for a in author_str.split(",") if a.strip()]
-    if not author_names:
-        author_names = ["Unknown"]
-    return [ArxivResult.Author(name=name) for name in author_names]
-
-
-def _parse_entry_time(struct_time: Any) -> datetime:
-    if struct_time:
-        try:
-            return datetime.fromtimestamp(calendar.timegm(struct_time), tz=timezone.utc)
-        except Exception:
-            pass
-    return datetime.min.replace(tzinfo=timezone.utc)
-
-
-def _entry_to_arxiv_result(entry: Any) -> ArxivResult:
-    raw_id = getattr(entry, "id", "") or ""
-    paper_id = raw_id.removeprefix("oai:arXiv.org:")
-    title_raw = getattr(entry, "title", "") or ""
-    title = " ".join(title_raw.split())
-
-    authors = _extract_authors(entry)
-    summary = _clean_abstract(getattr(entry, "summary", "") or "")
-
-    link = getattr(entry, "link", "") or f"https://arxiv.org/abs/{paper_id}"
-    pdf_url = f"https://arxiv.org/pdf/{paper_id}"
-    source_url = f"https://arxiv.org/src/{paper_id}"
-
-    tags = getattr(entry, "tags", []) or []
-    categories = [
-        t.get("term") for t in tags
-        if isinstance(t, dict) and t.get("term")
-    ]
-    # Prefer Atom's authoritative arxiv:primary_category field, with fallback to first category
-    primary_category = ""
-    arxiv_primary = getattr(entry, "arxiv_primary_category", None)
-    if isinstance(arxiv_primary, dict):
-        primary_category = arxiv_primary.get("term", "") or ""
-    elif hasattr(arxiv_primary, "term"):
-        primary_category = getattr(arxiv_primary, "term", "") or ""
-    elif isinstance(arxiv_primary, str):
-        primary_category = arxiv_primary
-
-    if not primary_category and categories:
-        primary_category = categories[0]
-
-    published = _parse_entry_time(getattr(entry, "published_parsed", None))
-    updated = _parse_entry_time(getattr(entry, "updated_parsed", None))
-    comment = getattr(entry, "arxiv_comment", "") or ""
-    journal_ref = getattr(entry, "arxiv_journal_reference", "") or getattr(entry, "arxiv_journal_ref", "") or ""
-    doi = getattr(entry, "arxiv_doi", "") or ""
-
-    links = [
-        ArxivResult.Link(href=link, rel="alternate"),
-        ArxivResult.Link(href=pdf_url, title="pdf", rel="related"),
-        ArxivResult.Link(href=source_url, title="source", rel="related"),
-    ]
-
-    return ArxivResult(
-        entry_id=link,
-        updated=updated,
-        published=published,
-        title=title,
-        authors=authors,
-        summary=summary,
-        comment=comment,
-        journal_ref=journal_ref,
-        doi=doi,
-        primary_category=primary_category,
-        categories=categories,
-        links=links,
-    )
-
-
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -214,24 +279,63 @@ class ArxivRetriever(BaseRetriever):
         if self.config.source.arxiv.category is None:
             raise ValueError("category must be specified for arxiv.")
 
-    def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        query = '+'.join(self.config.source.arxiv.category)
-        include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
+        arxiv_cfg = self.config.source.arxiv
+        # Defaults matter: CUSTOM_CONFIG on GitHub may predate these keys, and
+        # OmegaConf only merges keys that exist in base.yaml.
+        self.max_lookback_hours = arxiv_cfg.get("max_lookback_hours", 72)
+        if self.max_lookback_hours is not None:
+            self.max_lookback_hours = float(self.max_lookback_hours)
+        self.fallback_api = bool(arxiv_cfg.get("fallback_api", True))
+        self.fallback_max_results = int(arxiv_cfg.get("fallback_max_results", 200))
+        # sent_history 路径由 executor 注入（测试/本地可不注入以禁用跨 run 去重）
+        self._sent_history_path = None
+
+    # ------------------------------------------------------------ feed retrieval
+
+    def _fetch_feed(self, query: str, retry_num: int = 5, delay_time: int = 5) -> tuple[Any, int | None]:
+        """Fetch and validate the Atom feed; returns (parsed_feed, age_seconds)."""
         rss_url = f"https://rss.arxiv.org/atom/{query}"
 
         # Get latest papers from arxiv RSS feed with retry
-        retry_num = 5
-        delay_time = 5
         feed = None
+        age_seconds = None
         for attempt in range(retry_num):
-            feed = feedparser.parse(rss_url)
-            status = getattr(feed, "status", None)
-            bozo = getattr(feed, "bozo", False)
-            bozo_exc = getattr(feed, "bozo_exception", None)
-            feed_meta = getattr(feed, "feed", None)
-            title = getattr(feed_meta, "title", "") if feed_meta else ""
+            # Fetch the bytes first so the HTTP Age header is visible in the log.
+            # arXiv's feed sits behind a CDN (Fastly) that can serve bytes that
+            # are hours old; a plain feedparser.parse() hides that fact.
+            try:
+                response = requests.get(
+                    rss_url,
+                    timeout=DOWNLOAD_TIMEOUT,
+                    headers={"User-Agent": "zotero-arxiv-daily/1.0 (https://github.com/LinJieSha/zotero-arxiv-daily)"},
+                )
+                feed = feedparser.parse(response.content)
+                feed.status = response.status_code
+                age_seconds = _age_header_seconds(response)
+            except Exception as exc:
+                feed = None
+                logger.warning(f"Failed to request arxiv RSS feed ({exc}), retrying in {delay_time}s...")
+                if attempt < retry_num - 1:
+                    sleep(delay_time)
+                    continue
+                raise RuntimeError(f"Failed to request arxiv RSS feed from {rss_url}: {exc}") from exc
 
-            if title and "Feed error for query" in title:
+            # A stub that is not a mapping (no .get) cannot report parser state;
+            # treat it as invalid rather than crashing.
+            if feed is None or not hasattr(feed, "get"):
+                feed = None
+                status = None
+                bozo = False
+                bozo_exc = None
+                title = ""
+            else:
+                status = feed.get("status")
+                bozo_exc = feed.get("bozo_exception")
+                bozo = feed.get("bozo", False)
+                feed_meta = feed.get("feed")
+                title = feed_meta.get("title", "") if feed_meta else ""
+
+            if title and "Feed error for query" in title:  # invalid category
                 raise Exception(f"Invalid ARXIV_QUERY: {query}.")
 
             # Validate HTTP status and parser state before accepting the feed
@@ -256,9 +360,40 @@ class ArxivRetriever(BaseRetriever):
                 f"(status={status}, bozo_exception={bozo_exc})"
             )
 
+        return feed, age_seconds
+
+    @staticmethod
+    def _log_feed_state(feed: Any, age_seconds: int | None, n_entries: int) -> None:
+        """One line summarising the feed's freshness.
+
+        arXiv regenerates every category feed once per announcement (04:00 UTC
+        on weekdays). Entry ``<published>`` is always labelled 00:00 ET and says
+        nothing about when the batch actually appeared, so the feed-level
+        ``<updated>`` and the HTTP ``Age`` header are the only trustworthy
+        signals. Without them a stale/empty feed looks exactly like a quiet day.
+        """
+        # feedparser exposes parsed times as calendar.timegm-style tuples
+        # (struct_time), not datetimes, when the object was built by hand.
+        feed_meta = feed.get("feed") if isinstance(feed, Mapping) else None
+        feed_updated = _parse_entry_time(feed_meta.get("updated_parsed") if isinstance(feed_meta, Mapping) else None)
+        age_str = f"{age_seconds}s" if age_seconds is not None else "n/a"
+        updated_str = feed_updated.strftime("%Y-%m-%d %H:%M:%S UTC") if feed_updated else "n/a"
+        now = _now_utc()
+        fetched_str = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+        age_note = ""
+        if age_seconds is not None and age_seconds >= 3600:
+            age_note = f" (CDN copy is {age_seconds // 3600}h old - may be stale)"
+        logger.info(
+            f"arxiv feed fetched at {fetched_str}: entries={n_entries}, "
+            f"feed_updated={updated_str}, http_age={age_str}{age_note}"
+        )
+
+    def _entries_to_results(
+        self, entries: list[Any], include_cross_list: bool
+    ) -> tuple[list[ArxivResult], datetime | None]:
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
         target_entries = [
-            i for i in feed.entries
+            i for i in entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
         if self.config.executor.debug:
@@ -266,6 +401,7 @@ class ArxivRetriever(BaseRetriever):
 
         seen_paper_ids = set()
         raw_papers = []
+        newest = None
         for entry in target_entries:
             raw_id = getattr(entry, "id", "") or ""
             paper_id = raw_id.removeprefix("oai:arXiv.org:")
@@ -273,9 +409,160 @@ class ArxivRetriever(BaseRetriever):
                 continue
             if paper_id:
                 seen_paper_ids.add(paper_id)
-            raw_papers.append(_entry_to_arxiv_result(entry))
+            paper = _entry_to_arxiv_result(entry)
+            raw_papers.append(paper)
+            updated = _as_aware_utc(paper.updated)
+            if updated is not None and (newest is None or updated > newest):
+                newest = updated
+        return raw_papers, newest
+
+    def _entries_in_categories(self, entries: list[Any], include_cross_list: bool) -> list[Any]:
+        """Drop entries whose primary category is not one of the configured ones.
+
+        With include_cross_list=False we must not rely on feedparser's
+        arxiv_announce_type mapping: arXiv writes the type as a child element
+        (<arxiv:announce_type>, feedparser turns it into arxiv_announce_type)
+        but an attribute form (arxiv:announce_type="new") exists in older
+        snapshots and older feedparser versions, and the type is absent
+        entirely in some API-style entries -- all of which default to "new"
+        upstream. The primary category is the robust filter: on a cross-listed
+        entry the categories other than the first carry a "cs." prefix, and
+        the first <category> is the primary one.
+        """
+        wanted = {c.lower() for c in self.config.source.arxiv.category}
+        kept = []
+        for entry in entries:
+            tags = getattr(entry, "tags", None)
+            if tags is None:
+                tags = entry["tags"] if "tags" in entry else []
+            tags = tags or []
+            terms = [t.get("term", "") for t in tags if isinstance(t, dict) and t.get("term")]
+            primary = next((t for t in terms if not t.startswith("cs.")), terms[0] if terms else "")
+            primary_base = primary.split(".", 1)[1] if "." in primary else primary
+            if primary.lower() in wanted or primary_base.lower() in wanted:
+                kept.append(entry)
+            elif not include_cross_list:
+                logger.debug(f"skipping cross-listed entry {getattr(entry, 'id', '')} (primary={primary})")
+            else:
+                kept.append(entry)
+        return kept
+
+    def _retrieve_raw_papers(self) -> list[ArxivResult]:
+        query = '+'.join(self.config.source.arxiv.category)
+        include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
+
+        feed, age_seconds = self._fetch_feed(query)
+        entries = list(getattr(feed, "entries", []) or [])
+        self._log_feed_state(feed, age_seconds, len(entries))
+
+        entries = self._entries_in_categories(entries, include_cross_list)
+        raw_papers, newest = self._entries_to_results(entries, include_cross_list)
+
+        # Freshness gate. The feed only carries the latest announcement batch,
+        # so anything older than the lookback window is out of scope anyway
+        # (a Monday run must not re-send Friday's papers if the feed is stale).
+        stale = False
+        if self.max_lookback_hours and raw_papers:
+            cutoff = _now_utc() - timedelta(hours=self.max_lookback_hours)
+            stale = newest is not None and newest < cutoff
+            if stale:
+                logger.warning(
+                    f"arxiv feed looks stale: newest entry updated {newest.strftime('%Y-%m-%d %H:%M:%S UTC')}, "
+                    f"older than max_lookback_hours={self.max_lookback_hours}. Falling back to the arXiv API."
+                )
+        elif self.max_lookback_hours and not raw_papers:
+            logger.warning("arxiv feed returned no entries; falling back to the arXiv API.")
+
+        if (not raw_papers or stale) and self.fallback_api:
+            api_papers = self._retrieve_from_api()
+            if api_papers:
+                if raw_papers:
+                    logger.warning(
+                        f"arxiv API fallback supersedes {len(raw_papers)} feed entries "
+                        f"(feed was stale/empty): {len(api_papers)} papers from the API"
+                    )
+                # 联合检索：API 与 feed 结果合并去重（entry_id 为键）。
+                # 72h 窗口下 API 通常覆盖 feed 的批次，但 feed 若恰好比 API 新
+                # （API 索引延迟），feed 独有的条目也不该丢。
+                seen_ids = {p.entry_id for p in api_papers}
+                merged = list(api_papers) + [p for p in raw_papers if p.entry_id not in seen_ids]
+                raw_papers = merged
+
+        # Cross-run dedup against sent history: drop papers already emailed in a
+        # previous run. This is what makes a wide lookback window safe (the Tue/Thu
+        # batches that no push day reads will be picked up exactly once).
+        raw_papers = self._filter_already_sent(raw_papers)
 
         return raw_papers
+
+    def _filter_already_sent(self, raw_papers: list[ArxivResult]) -> list[ArxivResult]:
+        """按 sent_history 过滤已推送过的论文（尽力而为：历史不可用则不过滤）。"""
+        from ..sent_history import filter_unsent, load_sent_history, paper_id_from_url
+
+        history_path = getattr(self, "_sent_history_path", None)
+        if history_path is None:
+            return raw_papers
+        history = load_sent_history(history_path)
+        sent_map = history.get("sent", {})
+        kept = []
+        for p in raw_papers:
+            pid = paper_id_from_url(p.entry_id)
+            if pid in sent_map:
+                logger.debug(f"skipping already-sent paper {pid}")
+                continue
+            kept.append(p)
+        if len(kept) != len(raw_papers):
+            logger.info(
+                f"sent-history dedup: {len(raw_papers) - len(kept)} of {len(raw_papers)} "
+                f"candidates already sent in previous emails"
+            )
+        return kept
+
+    # ------------------------------------------------------------ API fallback
+
+    def _retrieve_from_api(self) -> list[ArxivResult]:
+        """Query the arXiv API directly for anything updated inside the window.
+
+        Used when the RSS feed is empty or stale. The API is not CDN-cached the
+        same way, so it recovers the batch even when rss.arxiv.org still serves
+        an old copy.
+        """
+        categories = list(self.config.source.arxiv.category)
+        search_query = " OR ".join(f"cat:{c}" for c in categories)
+        window_start = _now_utc() - timedelta(hours=self.max_lookback_hours or 36)
+        client = arxiv.Client(
+            page_size=self.fallback_max_results,
+            delay_seconds=3.0,   # arXiv API terms: >= 3 s between requests
+            num_retries=2,
+        )
+        try:
+            search = arxiv.Search(
+                query=search_query,
+                max_results=self.fallback_max_results,
+                sort_by=arxiv.SortCriterion.SubmittedDate,
+                sort_order=arxiv.SortOrder.Descending,
+            )
+            results = list(client.results(search))
+        except Exception as exc:
+            logger.error(f"arxiv API fallback failed ({type(exc).__name__}: {exc})")
+            return []
+
+        papers = []
+        for result in results:
+            # Updated is the field that reflects the announcement; Submitted
+            # (date of author submission) can be days earlier. Fall back to
+            # Published when a client does not expose Updated.
+            updated = _as_aware_utc(getattr(result, "updated", None) or getattr(result, "published", None))
+            if self.max_lookback_hours and (updated is None or updated < window_start):
+                continue
+            papers.append(result)
+        logger.info(
+            f"arxiv API fallback: {len(papers)} of {len(results)} latest {','.join(categories)} papers "
+            f"updated since {window_start.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+        return papers
+
+    # ------------------------------------------------------------ conversion
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title

@@ -27,6 +27,14 @@ source:
     # 会撞 GitHub Actions 6 小时限额。这类论文靠 Zotero 库的重排信号召回即可。
     category: ["cs.MA"]
     include_cross_list: false
+    # arXiv 每天工作日 04:00 UTC（北京 12:00）放出新批次，RSS feed 会被 CDN 缓存。
+    # 推送日 10:00 读到的批次距公告约 26h；72h 窗口同时覆盖：
+    # ① CDN 旧副本场景的 API 兜底；② 连续假期（最近批次可能 48h+）；③ 捞回
+    # 周二/周四晚那批「从未被推送过」的论文（每周 5 批公告只推 2 批）。
+    # 具体推没推过由 sent_history（已推送论文 ID 历史）保证不重复。
+    max_lookback_hours: 72
+    fallback_api: true
+    fallback_max_results: 200
 
 email:
   sender: ${oc.env:SENDER}
@@ -64,8 +72,8 @@ reranker:
     model: jinaai/jina-embeddings-v5-text-nano-retrieval
 
 executor:
-  # 本地首次验证保持 true（只取 10 篇）；上云前改回 false
-  debug: true
+  # 本地首次验证用 true（只取 10 篇）；线上/云端必须 false，否则只推前 10 篇
+  debug: false
   send_empty: false
   # 每篇论文消耗 2 次 LLM 调用（TL;DR + 作者单位）。调大前先算成本。
   max_paper_num: 30

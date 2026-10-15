@@ -20,6 +20,9 @@ def _raise_runtime_error() -> None:
 
 def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
     monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
+    # 本测试验证「feed → 条目 → Paper」的纯转换语义；禁用新鲜度门限，
+    # 否则 fixture 的旧日期条目会触发 API 兜底（那是 timing 测试的职责）。
+    monkeypatch.setattr(config.source.arxiv, "max_lookback_hours", None)
 
     # The RSS fixture gives us paper IDs.  After feedparser, the code calls
     # arxiv.Client().results(search) which makes real HTTP requests.  We mock
@@ -29,27 +32,6 @@ def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
         if e.get("arxiv_announce_type", "new") == "new"
     ]
     paper_ids = [e.id.removeprefix("oai:arXiv.org:") for e in new_entries]
-
-    # Build fake ArxivResult-like objects matching each RSS entry
-    fake_results = []
-    for entry in new_entries:
-        pid = entry.id.removeprefix("oai:arXiv.org:")
-        fake_results.append(SimpleNamespace(
-            title=entry.title,
-            authors=[SimpleNamespace(name="Test Author")],
-            summary="Test abstract",
-            pdf_url=f"https://arxiv.org/pdf/{pid}",
-            entry_id=f"https://arxiv.org/abs/{pid}",
-            source_url=lambda pid=pid: f"https://arxiv.org/e-print/{pid}",
-        ))
-
-    class FakeClient:
-        def __init__(self, **kw):
-            pass
-        def results(self, search):
-            return iter(fake_results)
-
-    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
 
     # Skip file downloads in convert_to_paper
     monkeypatch.setattr(arxiv_retriever, "extract_text_from_html", lambda paper: None)
@@ -65,7 +47,7 @@ def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
 
 def test_run_with_hard_timeout_returns_value():
     result = _run_with_hard_timeout(
-        _sleep_and_return, ("done", 0.01), timeout=1, operation="test op", paper_title="paper"
+        _sleep_and_return, ("done", 0.01), timeout=5, operation="test op", paper_title="paper"
     )
     assert result == "done"
 
@@ -74,7 +56,7 @@ def test_run_with_hard_timeout_returns_none_on_timeout(monkeypatch):
     warnings: list[str] = []
     monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append))
     result = _run_with_hard_timeout(
-        _sleep_and_return, ("done", 1.0), timeout=0.01, operation="test op", paper_title="paper"
+        _sleep_and_return, ("done", 30.0), timeout=0.05, operation="test op", paper_title="paper"
     )
     assert result is None
     assert "timed out" in warnings[0]
@@ -84,7 +66,7 @@ def test_run_with_hard_timeout_returns_none_on_failure(monkeypatch):
     warnings: list[str] = []
     monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append))
     result = _run_with_hard_timeout(
-        _raise_runtime_error, (), timeout=1, operation="test op", paper_title="paper"
+        _raise_runtime_error, (), timeout=5, operation="test op", paper_title="paper"
     )
     assert result is None
     assert "boom" in warnings[0]
@@ -153,7 +135,7 @@ def test_extract_authors():
 def test_entry_to_arxiv_result():
     import time
     st = time.strptime("2026-09-23 12:00:00", "%Y-%m-%d %H:%M:%S")
-    entry = SimpleNamespace(
+    entry = feedparser.FeedParserDict(
         id="oai:arXiv.org:2609.22090v1",
         title="  Recognition, Simulation, \n and Refusal  ",
         author="Joy Bose",
@@ -186,7 +168,7 @@ def test_entry_to_arxiv_result():
     assert len(result.links) == 3
 
     # Verify authoritative arxiv_primary_category takes precedence over category list order
-    entry_with_primary = SimpleNamespace(
+    entry_with_primary = feedparser.FeedParserDict(
         id="oai:arXiv.org:2609.22090v1",
         title="Title",
         author="Author",
@@ -199,7 +181,7 @@ def test_entry_to_arxiv_result():
     assert result_with_primary.primary_category == "cs.LG"
 
     # Verify Atom's arxiv_journal_reference field is mapped to journal_ref
-    entry_with_journal_ref = SimpleNamespace(
+    entry_with_journal_ref = feedparser.FeedParserDict(
         id="oai:arXiv.org:2609.22090v1",
         title="Title",
         author="Author",
@@ -213,6 +195,7 @@ def test_entry_to_arxiv_result():
 
 def test_retrieve_raw_papers_cross_list(config, mock_feedparser, monkeypatch):
     monkeypatch.setattr(config.source.arxiv, "include_cross_list", True)
+    monkeypatch.setattr(config.source.arxiv, "max_lookback_hours", None)  # 纯 feed 语义
     retriever = ArxivRetriever(config)
     raw = retriever._retrieve_raw_papers()
 
@@ -226,6 +209,7 @@ def test_retrieve_raw_papers_cross_list(config, mock_feedparser, monkeypatch):
 def test_retrieve_raw_papers_debug_mode(config, mock_feedparser, monkeypatch):
     monkeypatch.setattr(config.executor, "debug", True)
     monkeypatch.setattr(config.source.arxiv, "include_cross_list", True)
+    monkeypatch.setattr(config.source.arxiv, "max_lookback_hours", None)  # 纯 feed 语义
     retriever = ArxivRetriever(config)
     raw = retriever._retrieve_raw_papers()
     assert len(raw) <= 10
@@ -235,18 +219,20 @@ def test_retrieve_raw_papers_retries_on_http_failure(config, mock_feedparser, mo
     monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
     calls = []
 
-    def mock_parse_flaky(url):
+    def mock_get(url, timeout=None, headers=None):
         calls.append(url)
         if len(calls) < 2:
-            return SimpleNamespace(
-                status=500,
-                feed=SimpleNamespace(title="Server Error"),
-                entries=[],
-                bozo=False,
-            )
+            return SimpleNamespace(content=b"<html>error</html>", headers={}, status_code=500)
+        return SimpleNamespace(content=b"<feed/>", headers={"Age": "5"}, status_code=200)
+
+    def mock_parse(content):
+        if content == b"<html>error</html>":
+            # feedparser.parse() of an HTML error body: bozo, no entries, no meta
+            return feedparser.FeedParserDict({"bozo": True, "bozo_exception": Exception("500"), "entries": []})
         return mock_feedparser
 
-    monkeypatch.setattr(arxiv_retriever.feedparser, "parse", mock_parse_flaky)
+    monkeypatch.setattr(arxiv_retriever.requests, "get", mock_get)
+    monkeypatch.setattr(arxiv_retriever.feedparser, "parse", mock_parse)
     retriever = ArxivRetriever(config)
     raw = retriever._retrieve_raw_papers()
     assert len(calls) == 2

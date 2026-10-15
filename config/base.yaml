@@ -8,6 +8,14 @@ source:
   arxiv:
     category: null # The categories of target arxiv papers. Find the abbr of your research area from [here](https://arxiv.org/category_taxonomy). Example: ["cs.AI","cs.CV","cs.LG","cs.CL"]
     include_cross_list: false # Whether to include arXiv cross-list papers in subscribed categories. Example: true
+    # The Atom feed only carries the latest announcement batch. arXiv announces
+    # every weekday at 04:00 UTC (12:00 Beijing); anything updated before this
+    # window is treated as stale and the arXiv API is queried instead.
+    # 72h covers consecutive holidays (latest batch can be 48h+ old) and lets the
+    # API fallback also pick up the Tue/Thu batches that no push day ever reads.
+    max_lookback_hours: 72 # How far back "new" means, in hours. null disables the freshness gate. Example: 72
+    fallback_api: true # Query the arXiv API when the RSS feed is empty or stale. Example: true
+    fallback_max_results: 200 # Page size for the API fallback (arXiv API terms: one request >= 3 s apart). Example: 200
   biorxiv:
     category: null # The categories of target biorxiv papers. Find categories from [here](https://www.biorxiv.org/). Example: ["biochemistry","animal behavior and cognition"]
   medrxiv:
@@ -52,3 +60,4 @@ executor:
   max_paper_num: 100 # The maximum number of the papers presented in the email. Example: 100
   source: ??? # The sources of papers to retrieve. Example: ['arxiv','biorxiv','medrxiv','chemrxiv']
   reranker: local # The reranker to use. Example: 'local' or 'api'
+  sent_history_path: sent_history.json # Where the sent-history (cross-run dedup) is stored, relative to the repo root. Committed back by the workflow. Example: sent_history.json

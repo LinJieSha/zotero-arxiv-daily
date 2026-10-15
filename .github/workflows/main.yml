@@ -1,15 +1,20 @@
 name: Send emails twice a week
+# concurrency：同一时刻只允许一个推送 run（后进的取消先进的），防止重复邮件
+concurrency:
+  group: paper-push
+  cancel-in-progress: true
 on:
   workflow_dispatch:
   # GitHub 禁用 fork 仓库的 schedule（定时任务），但允许外部通过 API 推送
   # repository_dispatch 事件触发。这条路径已实测可用（HTTP 204）。
-  # 由 Windows 任务计划程序在每周一/周四 14:00 调 API 触发。
+  # 由 Windows 任务计划程序在每周二/周五 10:00（+开机/登录兜底）调 API 触发；
+  # 一天只派发一次，送达由本机脚本回查本 run 的日志确认，失败才补发。
   repository_dispatch:
     types: [scheduled-run]
   schedule:
-    # 保留原 cron：若将来 GitHub 放开 fork 限制，或仓库脱离 fork 网络，可直接生效
-    # 每周一、周四 北京时间 14:00（GitHub cron 固定用 UTC，北京 = UTC+8）
-    - cron: '0 6 * * 1,4'
+    # fork 上不生效（GitHub 禁用 fork 的定时任务），保留作为文档与将来解除限制后的后备。
+    # 每天 04:00 UTC = 北京 12:00，即 feed 重建（装上前一天公告批次）之后。
+    - cron: '0 4 * * *'
 
 jobs:
   calculate-and-send:
@@ -38,4 +43,37 @@ jobs:
           printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
           echo "Use custom config: "
           cat config/custom.yaml
-          uv run src/zotero_arxiv_daily/main.py
+          set +e
+          uv run src/zotero_arxiv_daily/main.py 2>&1 | tee pipeline.log
+          status=${PIPESTATUS[0]}
+          set -e
+          # 把结果写进 run summary 与环境，供本机脚本回查与人工快速判断：
+          # 0papers / email-sent / failed(n)
+          # 注意：这里不再做 GitHub 侧自重试 —— 单日一推与失败补发
+          # 由 trigger_workflow.ps1 统一负责（2026-10-15 恢复原始规划）。
+          if grep -q 'Total 0 papers retrieved' pipeline.log; then RESULT=0papers
+          elif grep -q 'No arxiv papers found' pipeline.log; then RESULT=0papers
+          elif grep -q 'Email sent successfully' pipeline.log; then RESULT=email-sent
+          else RESULT="failed($status)"; fi
+          echo "RESULT=$RESULT" >> "$GITHUB_ENV"
+          echo "### Run result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # ---------------------------------------------------------------------------
+      # sent_history 回写：发信成功后把 sent_history.json commit 回仓库。
+      # 下次 run checkout 读到它，检索层即可跳过已推送过的论文 —— 这是跨 run
+      # 去重的持久层（宽回看窗口 + 捞回漏推批次且不重复，全靠它）。
+      # 没发信 / 失败都不 commit：失败重推时这些论文仍是"未推送"。
+      # ---------------------------------------------------------------------------
+      - name: Commit sent history if email was sent
+        if: env.RESULT == 'email-sent'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sent_history.json
+          if git diff --staged --quiet; then
+            echo "No sent_history changes to commit"
+          else
+            git commit -m "chore: update sent history [skip ci]"
+            git push
+          fi

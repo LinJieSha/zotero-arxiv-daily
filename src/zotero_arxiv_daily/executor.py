@@ -39,6 +39,19 @@ class Executor:
         }
         self.reranker = get_reranker_cls(config.executor.reranker)(config)
         self.openai_client = OpenAI(api_key=config.llm.api.key, base_url=config.llm.api.base_url)
+        # 跨 run 去重：sent_history.json（存在时）记录已推送过的论文 ID。
+        # 路径默认为仓库根的 sent_history.json；executor 在发信成功后写入，
+        # workflow 步骤负责 commit 回仓库，下次 run 读到即完成闭环。
+        from pathlib import Path
+        from .sent_history import load_sent_history
+        default_hist = Path(__file__).resolve().parents[2] / "sent_history.json"
+        self.sent_history_path = Path(
+            getattr(config.executor, "sent_history_path", str(default_hist))
+        )
+        self.sent_history = load_sent_history(self.sent_history_path)
+        for retriever in self.retrievers.values():
+            if hasattr(retriever, "_sent_history_path"):
+                retriever._sent_history_path = self.sent_history_path
     def fetch_zotero_corpus(self) -> list[CorpusPaper]:
         logger.info("Fetching zotero corpus")
         zot = zotero.Zotero(self.config.zotero.user_id, 'user', self.config.zotero.api_key)
@@ -122,3 +135,17 @@ class Executor:
         email_content = render_email(reranked_papers)
         send_email(self.config, email_content)
         logger.info("Email sent successfully")
+        # 发信成功才记入 sent_history（no-papers / 失败都不记 —— 失败重推时
+        # 这些论文仍是"未推送"状态，不会因记早了而永远漏推）。
+        try:
+            from .sent_history import paper_id_from_url, prune_history, record_sent, save_sent_history
+            ids = [paper_id_from_url(p.url) for p in reranked_papers if getattr(p, "url", None)]
+            record_sent(ids, self.sent_history)
+            self.sent_history, removed = prune_history(self.sent_history)
+            if save_sent_history(self.sent_history_path, self.sent_history):
+                logger.info(
+                    f"sent history updated: +{len(ids)} papers"
+                    + (f", pruned {removed} oldest" if removed else "")
+                )
+        except Exception as exc:
+            logger.warning(f"failed to update sent history (dedup will miss these next run): {exc}")
