@@ -77,3 +77,4 @@ jobs:
             git commit -m "chore: update sent history [skip ci]"
             git push
           fi
+# touch: re-register workflow (2026-10-15)
