@@ -26,6 +26,13 @@ class TestLoadSave:
         h = load_sent_history(p)
         assert h == {"version": 1, "sent": {}}
 
+    def test_bom_file_is_tolerated(self, tmp_path: Path):
+        # Windows 工具（PS 5.1 Set-Content utf8）会写 BOM；必须能读
+        p = tmp_path / "bom.json"
+        p.write_bytes(b"\xef\xbb\xbf" + b'{"version":1,"sent":{"a":{"date":"2026-10-16"}}}')
+        h = load_sent_history(p)
+        assert "a" in h["sent"]
+
     def test_roundtrip(self, tmp_path: Path):
         p = tmp_path / "h.json"
         h = record_sent(["2610.1v1"], {"version": 1, "sent": {}})

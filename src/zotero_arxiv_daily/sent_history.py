@@ -44,7 +44,11 @@ def load_sent_history(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"version": 1, "sent": {}}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        # 容错：UTF-8 BOM（Windows 工具写入的）会让 json 解析失败，剥掉
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict) or not isinstance(data.get("sent"), dict):
             raise ValueError("unexpected structure")
         return data
