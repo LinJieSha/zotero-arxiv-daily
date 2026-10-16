@@ -5,16 +5,16 @@ concurrency:
   cancel-in-progress: true
 on:
   workflow_dispatch:
-  # GitHub 禁用 fork 仓库的 schedule（定时任务），但允许外部通过 API 推送
-  # repository_dispatch 事件触发。这条路径已实测可用（HTTP 204）。
-  # 由 Windows 任务计划程序在每周二/周五 10:00（+开机/登录兜底）调 API 触发；
-  # 一天只派发一次，送达由本机脚本回查本 run 的日志确认，失败才补发。
+  # 推送由本机计划任务触发（周二/周五 10:00 + 开机/登录兜底），走 repository_dispatch：
+  # 一天只派发一次；送达由本机脚本回查本 run 日志确认，失败才补发一次。
   repository_dispatch:
     types: [scheduled-run]
-  schedule:
-    # fork 上不生效（GitHub 禁用 fork 的定时任务），保留作为文档与将来解除限制后的后备。
-    # 每天 04:00 UTC = 北京 12:00，即 feed 重建（装上前一天公告批次）之后。
-    - cron: '0 4 * * *'
+  # ⚠️ 这里刻意不写 schedule/cron —— 2026-10-16 实测教训：
+  #    "fork 上 schedule 不生效"的前提是 Actions 被整体禁用；一旦在网页端点过
+  #    "I understand my workflows, go ahead and re-enable them"，cron 会立刻复活，
+  #    绕过本机脚本的单日一推/送达回查，变成每天一封、时间不可控（当天原定 04:00 UTC，
+  #    GitHub 延迟到 08:48 UTC 才跑，凭空多出一封计划外邮件）。
+  #    推送时刻的唯一来源 = 本机计划任务（见 trigger_workflow.ps1 / setup_scheduler.ps1）。
 
 jobs:
   calculate-and-send:
