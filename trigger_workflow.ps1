@@ -222,12 +222,21 @@ function Read-RunOutcomeText {
             $reader = New-Object System.IO.StreamReader($entry.Open())
             $logText = $reader.ReadToEnd()
             $reader.Close()
-            if ($logText -match 'Email sent successfully') { $outcome = 'sent'; break }
-            if ($logText -match 'Total 0 papers retrieved' -or
-                $logText -match 'No arxiv papers found' -or
-                $logText -match 'No new papers found\. No email will be sent') {
-                $zeroPapers = $true
+            # ⚠️ 坑 25：Actions 会把 run: 步骤的「脚本原文」回显进日志，而脚本里就写着
+            #    `elif grep -q 'Email sent successfully' pipeline.log` —— 全文匹配会命中
+            #    这段回显，把 0 篇甚至失败的运行都误判成 sent（并让失败补发永不触发）。
+            #    因此只认「程序输出行」：loguru 输出行含模块名 zotero_arxiv_daily，
+            #    脚本回显行不含（回显里唯一提到该模块名的是 uv run 那行，不含任何结果标记）。
+            foreach ($line in ($logText -split "`n")) {
+                if ($line -notmatch 'zotero_arxiv_daily') { continue }
+                if ($line -match 'Email sent successfully') { $outcome = 'sent'; break }
+                if ($line -match 'Total 0 papers retrieved' -or
+                    $line -match 'No arxiv papers found' -or
+                    $line -match 'No new papers found\. No email will be sent') {
+                    $zeroPapers = $true
+                }
             }
+            if ($outcome -eq 'sent') { break }
         }
         if ($outcome -ne 'sent' -and $zeroPapers) { $outcome = 'no-papers' }
         return $outcome
